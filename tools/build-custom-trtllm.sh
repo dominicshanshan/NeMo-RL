@@ -185,7 +185,7 @@ ccache --zero-stats
 TRTLLM_BUILD_LOG=$(mktemp /tmp/trtllm-build.XXXXXX.log)
 set +x
 TRTLLM_BUILD_CMD=(
-    python3 scripts/build_wheel.py
+    python3 scripts/build_wheel.py --yes
     -a "$ARCH"
     -G Ninja
     --clean
