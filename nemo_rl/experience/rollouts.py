@@ -2054,7 +2054,9 @@ async def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    if "vllm_cfg" in policy_generation.cfg:
+    if "trtllm_cfg" in policy_generation.cfg:
+        engine_max_model_len = policy_generation.cfg["trtllm_cfg"]["max_model_len"]
+    elif "vllm_cfg" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
     elif "mcore_generation_config" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["mcore_generation_config"][
