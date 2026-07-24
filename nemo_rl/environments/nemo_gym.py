@@ -598,8 +598,11 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config = config.policy["generation"]
 
     # Enable the http server. Requires both async engine and the expose_http_server flag
-    generation_config["vllm_cfg"]["async_engine"] = True
-    generation_config["vllm_cfg"]["expose_http_server"] = True
+    backend_cfg_key = (
+        "trtllm_cfg" if generation_config.get("backend") == "trtllm" else "vllm_cfg"
+    )
+    generation_config[backend_cfg_key]["async_engine"] = True
+    generation_config[backend_cfg_key]["expose_http_server"] = True
 
     # Stop strings or token ids are not supported
     generation_config["stop_strings"] = None
