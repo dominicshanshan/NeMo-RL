@@ -203,6 +203,12 @@ NINJA_STATUS='NINJA_PROGRESS:%f:%t:%p:' \
 TRTLLM_BUILD_STATUS=$?
 set -e
 
+# Persist the full build log outside the container: the /tmp copy dies with
+# the build env, and the 200-line failure tail gets flooded by ccache stats.
+if [[ -n "${WHEEL_OUTPUT_DIR:-}" ]]; then
+    cp -f "$TRTLLM_BUILD_LOG" "${WHEEL_OUTPUT_DIR}/trtllm-build-last.log" 2>/dev/null || true
+fi
+
 if ((TRTLLM_BUILD_STATUS != 0)); then
     echo "[ERROR] Command failed with exit code ${TRTLLM_BUILD_STATUS}:" >&2
     printf '  ' >&2
