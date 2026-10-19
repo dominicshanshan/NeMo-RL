@@ -123,6 +123,15 @@ class NcclExtension(WorkerExtension):
         with self.engine.control_action(drain=False):
             self.engine.reset_prefix_cache()
 
+    def finish_weight_update(self,recompute_kv: bool = False) -> None:
+        """Finalize runtime caches and captures after refit."""
+        if recompute_kv:
+            self.engine.recompute_active_requests()
+        torch.cuda.synchronize()
+        self.engine.model_engine.restore_compiled_model_after_refit(
+            self.engine.resource_manager
+        )
+
     # ------------------------------------------------------------------ #
     #  NCCL weight receive + reload
     # ------------------------------------------------------------------ #
@@ -176,7 +185,7 @@ class NcclExtension(WorkerExtension):
                     post_unpack_func=load_model_weight_func,
                 )
                 self.finalize_weight_update()
-                self.finish_weight_update()
+                self.finish_weight_update(recompute_kv=recompute_kv)
             except Exception as e:
                 model_engine.model_loader.abort_update_weights()
                 print(f"Error in NcclExtension.update_weights_from_collective: {e}")
