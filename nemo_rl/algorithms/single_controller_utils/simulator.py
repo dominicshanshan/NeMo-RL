@@ -155,7 +155,7 @@ def apply_simulator_overrides(
         rollout-only run serves generation, so the generation resources and
         ``cluster.num_nodes`` are the same number.
       - ``data.validation``: there is no validation pass without a trainer.
-      - ``policy.generation.vllm_cfg.load_format`` defaults to ``auto``: the
+      - ``policy.generation.{vllm,trtllm}_cfg.load_format`` defaults to ``auto``: the
         engine serves the checkpoint, since no refit follows to replace the
         ``dummy`` weights a training run starts from. An explicit ``dummy`` is
         rejected by :func:`validate_simulator_config`.
@@ -188,6 +188,8 @@ def apply_simulator_overrides(
         # Where configure_generation_config would default a training run to
         # "dummy" (the first refit fills the weights in), there is no refit here.
         generation["vllm_cfg"].setdefault("load_format", "auto")
+    elif generation["backend"] == "trtllm":
+        generation["trtllm_cfg"].setdefault("load_format", "auto")
     nemo_gym = raw_config["env"].get("nemo_gym")
     if isinstance(nemo_gym, dict):
         nemo_gym.pop("is_trajectory_collection", None)
@@ -245,24 +247,26 @@ def validate_simulator_config(
         )
     generation_config = cast(dict[str, Any], master_config.policy["generation"])
     backend = generation_config["backend"]
-    if backend != "vllm":
+    if backend not in ("vllm", "trtllm"):
         raise NotImplementedError(
-            "rollout_only currently supports policy.generation.backend='vllm' "
+            "rollout_only supports policy.generation.backend='vllm' or 'trtllm' "
             f"only; got {backend!r}. Megatron generation serves the trainer's own "
-            "weights, so it cannot run without one; trtllm, sglang and dynamo "
+            "weights, so it cannot run without one; sglang and dynamo "
             "have not been validated under the SingleController refit "
             "lifecycle this run drives."
         )
     reject_online_quantization(master_config.policy["generation"])
-    if generation_config["vllm_cfg"].get("load_format") == "dummy":
+    backend_cfg_name = f"{backend}_cfg"
+    backend_cfg = generation_config[backend_cfg_name]
+    if backend_cfg.get("load_format") == "dummy":
         raise ValueError(
-            "rollout_only cannot run with vllm_cfg.load_format='dummy': no refit "
+            f"rollout_only cannot run with {backend_cfg_name}.load_format='dummy': no refit "
             "follows to replace the dummy weights, so the engine would serve "
             "random weights for the whole run. Drop the override; the driver "
             "defaults load_format to 'auto'."
         )
-    kv_cache_dtype = generation_config["vllm_cfg"].get("kv_cache_dtype")
-    if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
+    kv_cache_dtype = backend_cfg.get("kv_cache_dtype")
+    if backend == "vllm" and kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
         raise NotImplementedError(
             f"vllm_cfg.kv_cache_dtype={kv_cache_dtype!r} calibrates its KV scales "
             "on the trainer at every refit, which rollout_only has no trainer for."

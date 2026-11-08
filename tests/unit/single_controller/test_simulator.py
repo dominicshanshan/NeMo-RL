@@ -212,8 +212,8 @@ def test_validate_rejects_ppo() -> None:
         validate_simulator_config(_master_config(ppo=True), SimulatorSettings())
 
 
-@pytest.mark.parametrize("backend", ["megatron", "trtllm", "sglang", "dynamo"])
-def test_validate_rejects_non_vllm_backends(backend: str) -> None:
+@pytest.mark.parametrize("backend", ["megatron", "sglang", "dynamo"])
+def test_validate_rejects_unsupported_backends(backend: str) -> None:
     with pytest.raises(NotImplementedError, match="vllm"):
         validate_simulator_config(_master_config(backend=backend), SimulatorSettings())
 
@@ -557,3 +557,21 @@ def test_entrypoint_rejects_unimplemented_mode_before_loading_anything(
     args, _ = run_single_controller_simulator.parse_args()
     with pytest.raises(NotImplementedError, match="train_only"):
         run_single_controller_simulator.settings_from_args(args)
+
+
+@pytest.mark.parametrize("load_format", ["auto", "dummy"])
+def test_trtllm_rollout_only_requires_checkpoint_weights(load_format: str) -> None:
+    raw = _raw_config()
+    raw["policy"]["generation"].update(
+        backend="trtllm", trtllm_cfg={"load_format": load_format}
+    )
+    settings = SimulatorSettings()
+    apply_simulator_overrides(raw, settings)
+    config = _master_config(
+        backend="trtllm", generation_extra={"trtllm_cfg": raw["policy"]["generation"]["trtllm_cfg"]}
+    )
+    if load_format == "dummy":
+        with pytest.raises(ValueError, match="trtllm_cfg.load_format"):
+            validate_simulator_config(config, settings)
+    else:
+        validate_simulator_config(config, settings)

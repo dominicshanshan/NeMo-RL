@@ -1,0 +1,77 @@
+# Ultra SWE rollout-only with a CPU trainer and ready-first SC scheduling.
+# Run with examples/run_single_controller_simulator.py --num-nodes 16.
+defaults: grpo_ultra_swe_trtllm_disagg_dep16_ctxmoe16k_mb4_kv070.yaml
+
+cluster:
+  num_nodes: 16
+  segment_size: 16
+
+checkpointing:
+  _override_: true
+  enabled: false
+  checkpoint_dir: /results/checkpoints
+  metric_name: null
+  keep_top_k: null
+  higher_is_better: true
+  save_period: 5
+  save_optimizer: false
+  checkpoint_must_save_by: null
+
+grpo:
+  max_num_steps: 3
+  async_grpo: null
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+  seq_logprob_error_threshold: null
+
+loss_fn:
+  force_on_policy_ratio: false
+
+policy:
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step},${grpo.num_generations_per_prompt}}
+  generation:
+    colocated:
+      resources:
+        num_nodes: 16
+    trtllm_cfg:
+      load_format: auto
+      in_flight_weight_updates: true
+      recompute_kv_cache_after_weight_updates: ${async_rl.recompute_kv_cache_after_weight_updates}
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2,${cluster.num_nodes}}
+
+async_rl:
+  diagnostics: true
+  sampler:
+    name: ready_first
+    max_staleness_versions: 1
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${mul:2,${grpo.num_prompts_per_step}}
+  max_buffered_rollouts: ${mul:2,${grpo.num_prompts_per_step}}
+  recompute_kv_cache_after_weight_updates: false
+  generation_fleet_health:
+    refit_timeout_s: null
+  stall_watchdog:
+    interval_s: 10
+    stall_timeout_s: 7200
+
+rollout_checkpointing:
+  telemetry_interval_s: 2
+
+token_capture:
+  enabled: false
+
+logger:
+  log_dir: /results/logs/sc
+  tensorboard_enabled: true
+  wandb_enabled: false
+  mlflow_enabled: false

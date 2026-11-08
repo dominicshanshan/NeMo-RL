@@ -439,7 +439,7 @@ def _inference_gpus_per_instance(master_config: MasterConfig) -> int:
 
     vLLM: TP x PP. SGLang: gpus_per_server already covers every parallelism
     dimension. Megatron: the NVLink-domain span of the generation parallelism.
-    Dynamo: the engine world size.
+    Dynamo: the engine world size. TRT-LLM: the whole prefill/decode replica.
     """
     generation_config = cast(dict[str, Any], master_config.policy["generation"])
     backend = generation_config["backend"]
@@ -450,13 +450,15 @@ def _inference_gpus_per_instance(master_config: MasterConfig) -> int:
         )
     if backend == "dynamo":
         return DynamoConfig.model_validate(generation_config).engine_world_size
+    if backend == "trtllm":
+        return replica_width(cast(TrtllmConfig, generation_config))
     if backend == "sglang":
         return generation_config["sglang_cfg"].get("gpus_per_server", 1)
     if backend == "megatron":
         return MegatronGeneration.nvlink_domain_span(master_config.policy)
     raise ValueError(
         "single_controller_utils.setup only supports vllm, sglang, "
-        f"megatron, or dynamo generation; got {backend!r}"
+        f"trtllm, megatron, or dynamo generation; got {backend!r}"
     )
 
 
