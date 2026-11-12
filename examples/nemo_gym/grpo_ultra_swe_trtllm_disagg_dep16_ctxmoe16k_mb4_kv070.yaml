@@ -417,9 +417,8 @@ policy:
         # block reuse OFF entirely (driver log: "Disabling KV cache block reuse
         # for the hybrid Mamba model"; effective enable_block_reuse=False).
         # This attempt adds the explicit stable boundary the docs require.
-        # Requests still carry no conversation id, so per-conversation
-        # retention (max_num_turns) is inert; effective behaviour = per_request
-        # commits + a Mamba snapshot at each prompt end.
+        # Retention across turns requires Gym's session-id forwarding and the
+        # conversation-affine routing configured above.
         block_reuse_config:
           policy: per_conversation
           max_num_turns: 3

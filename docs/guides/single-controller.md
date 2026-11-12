@@ -548,6 +548,49 @@ The stall watchdog and throughput telemetry run for both vLLM and TRT-LLM. Backe
 
 For TRT-LLM PD on Ultra SWE, use `examples/nemo_gym/grpo_ultra_swe_trtllm_disagg_dep16_sc_rollout_only.yaml`. It retains the source recipe's 2 prefill and 2 decode engines (DEP16 each, 16 GB200 nodes), uses `ready_first`, and samples throughput every two seconds. `rollout/throughput/controller_inflight_rollouts` counts prompt groups, each with `num_generations_per_prompt` sibling trajectories; it is not the engine's active-request count. Simulated steps advance scheduling versions while the model weights remain fixed.
 
+### Ultra SWE with TRT-LLM and ready-first
+
+Use the original 2P2D recipe, `examples/nemo_gym/grpo_ultra_swe_trtllm_disagg_dep16_sc_rollout_only.yaml`. It configures:
+
+| Setting | Value |
+| --- | --- |
+| Allocation | 16 GB200 nodes, 4 GPUs per node |
+| Prefill | 2 DEP16 engines, attention DP enabled |
+| Decode | 2 DEP16 engines, attention DP enabled |
+| Host cache | The base recipe's automatic sizing for both roles |
+| Gym | 16 SWE replicas, `STRICT_SPREAD`, one per node |
+| Sampler | `ready_first`, `max_staleness_versions: 1` |
+| Step size | 32 prompt groups, 16 sibling trajectories per group |
+| Inflight / buffer limits | 64 prompt groups each; up to 1024 initial trajectories |
+
+Use a TRT-LLM image with the custom Nemotron-H hybrid-cache support required by the base recipe, and Gym session-ID forwarding from NVIDIA-NeMo/Gym#3582. The experiments used `nemo-rl-trt95ea967-swe-gym3582-aarch64.sqsh`. Mount this checkout's `nemo_rl/` and `examples/` over `/opt/nemo-rl/nemo_rl` and `/opt/nemo-rl/examples`, and mount the model, JSONL dataset, SWE SIF directory and writable result directory into every container.
+
+On Slurm, allocate sixteen nodes with `ray.sub`, then run the command below through its `<JOBID>-attach.sh` script. Each DEP16 engine needs four nodes sharing an actual **Multicast Pointer** clique. For four engines, a compatible allocation can contribute eight nodes from each of two cliques, or four from each of four cliques. Sharing a unicast fabric UUID alone is insufficient. The TRT-LLM setup verifies multicast compatibility before creating engine workers. Keep the Gym replica count within the number of Ray nodes: the sixteen-replica recipe cannot be placed on twelve nodes with `STRICT_SPREAD`.
+
+Inside the container, from `/opt/nemo-rl`:
+
+```bash
+export HF_CKPT_PATH=/path/to/ultra_stage2sft_step300
+export NEMO_GYM_SWE_TRAIN_DATA_PATH=/path/to/swebench_verified_lyris_sif_479.jsonl
+export NEMO_GYM_SWE_VALIDATION_DATA_PATH="$NEMO_GYM_SWE_TRAIN_DATA_PATH"
+export NEMO_GYM_SWE_SIF_DIR=/path/to/swe-bench-verified-arm64
+export RAY_ADDRESS=auto
+export TRTLLM_HYBRID_DISAGG_REUSE=1
+export TLLM_MAMBA_FOLD_SAVE_LAST=1
+export TLLM_ADP_PACKED_SYNC=1
+export TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=1
+export TRTLLM_MOE_A2A_FORCE_CFT=0
+
+uv run --no-sync python -u examples/run_single_controller_simulator.py \
+  --config examples/nemo_gym/grpo_ultra_swe_trtllm_disagg_dep16_sc_rollout_only.yaml \
+  --mode rollout_only --train-backend cpu \
+  --num-nodes 16 --num-steps 3 --train-time-s 720 --refit-time-s 0 \
+  logger.log_dir=/results/logs/sc \
+  env.nemo_gym.results_dir=/results/logs/nemo_gym
+```
+
+The generation engines and SWE environments are real; policy weights remain fixed while SC's scheduling versions advance. `--train-time-s 720` requests a twelve-minute simulated hold, but the simulator skips its remaining idle time if all rollouts finish. Check `train/simulated_train_idle_skipped_s` when comparing timings.
+
 `tests/functional/grpo_async_gym_single_controller_rollout_only.sh` is the smoke for this path: the recipe and overrides of `tests/functional/grpo_async_gym_single_controller.sh` (`examples/nemo_gym/grpo_qwen3_30ba3b_instruct.yaml` on Qwen3-0.6B with a 1-GPU vLLM split) with the trainer stubbed out, gated on a scored rollout and on the stand-in's metrics.
 
 Not supported by `rollout_only`: PPO, generation backends other than vLLM and TRT-LLM (Megatron generation serves the trainer's own weights; SGLang and Dynamo are not validated under the SC refit lifecycle), checkpointing, on-policy distillation, `token_capture.defer_routed_experts_to_policy`, `token_capture.forest_training`, refittable fp8 KV caches, adaptive-ppo-clip, and online quantization (`precision: fp8`, `nvfp4_pertoken_rollout`, `quant_cfg`, `real_quant`): those quantize at refit, which this run has none of. Setup rejects each before any engine starts. The `train_only` mode and the `cpu` rollout backend are tracked in [issue #4860](https://github.com/NVIDIA-NeMo/RL/issues/4860).
@@ -668,7 +711,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). SGLang and TRT-LLM have not been tested on SC.
+- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). TRT-LLM supports fixed-fleet, non-colocated generation, including PD disaggregation through NeMo-Gym. SGLang has not been validated on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, but each critic epoch must contain exactly `value.train_global_batch_size` samples in either value-training mode, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — `reward_shaping`, `reward_scaling`, and `use_dynamic_sampling` are implemented on neither algorithm block, so setup rejects them rather than silently skipping the shaping. Environment-flagged sample masking and `overlong_filtering` are supported; truncated completions are excluded from the loss through `sample_mask`, and a step in which every completion is filtered is rejected rather than skipped.
