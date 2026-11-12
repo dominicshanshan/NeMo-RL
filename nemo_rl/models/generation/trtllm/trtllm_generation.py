@@ -21,11 +21,14 @@ to time-multiplex GPU memory between training and inference phases.
 
 import asyncio
 import os
+import subprocess
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union, cast
 
 import numpy as np
 import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
@@ -49,6 +52,80 @@ from nemo_rl.models.generation.trtllm.config import (
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
+
+
+@ray.remote(num_cpus=0)  # pragma: no cover
+def _node_multicast_cliques() -> set[tuple[str, str]]:
+    """Return multicast pointer cliques shared by all visible GPUs on a node."""
+    result = subprocess.run(
+        ["nvidia-smi", "-q", "-x"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    root = ET.fromstring(result.stdout)
+    common: set[tuple[str, str]] | None = None
+    for gpu in root.findall("gpu"):
+        fabric = gpu.find("fabric")
+        if fabric is None or fabric.findtext("status") != "Success":
+            raise ValueError("MNNVL requires healthy GPU fabric information")
+        uuid = fabric.findtext("clusterUuid")
+        if not uuid:
+            raise ValueError("MNNVL requires a GPU fabric cluster UUID")
+        cliques = {
+            (uuid, entry.findtext("clique_id", ""))
+            for entry in fabric.findall("cliques/clique_entry")
+            if entry.findtext("clique_type") == "Multicast Pointer"
+        }
+        if not cliques:
+            raise ValueError(
+                "Cross-node MNNVL requires Multicast Pointer clique information; "
+                "the legacy CliqueId identifies unicast connectivity only"
+            )
+        common = cliques if common is None else common & cliques
+    if not common:
+        raise ValueError("No multicast pointer clique is shared by the node's GPUs")
+    return common
+
+
+def _place_mnnvl_engines(
+    *,
+    flat: list[int],
+    bundle_to_node: dict[int, str],
+    node_cliques: dict[str, set[tuple[str, str]]],
+    engine_tps: list[int],
+    mnnvl_engines: list[int],
+) -> list[list[int]]:
+    """Reserve multicast-compatible bundles before placing unconstrained engines."""
+    remaining = list(flat)
+    groups: list[list[int]] = [[] for _ in engine_tps]
+    for engine in sorted(mnnvl_engines, key=lambda idx: -engine_tps[idx]):
+        candidates: dict[tuple[str, str], list[int]] = {}
+        for bundle in remaining:
+            for clique in sorted(node_cliques[bundle_to_node[bundle]]):
+                candidates.setdefault(clique, []).append(bundle)
+        width = engine_tps[engine]
+        eligible = next(
+            (group for group in candidates.values() if len(group) >= width), None
+        )
+        if eligible is None:
+            capacities = {
+                str(clique): len(group) for clique, group in candidates.items()
+            }
+            raise ValueError(
+                f"MNNVL engine {engine} needs {width} GPUs in one multicast "
+                f"pointer clique; available GPU counts: {capacities}"
+            )
+        groups[engine] = eligible[:width]
+        used = set(groups[engine])
+        remaining = [bundle for bundle in remaining if bundle not in used]
+    for engine, width in enumerate(engine_tps):
+        if not groups[engine]:
+            groups[engine], remaining = remaining[:width], remaining[width:]
+            if len(groups[engine]) != width:
+                raise ValueError(f"Not enough bundles for engine {engine}")
+    return groups
 
 
 class TrtllmGeneration(GenerationInterface):
@@ -551,13 +628,52 @@ class TrtllmGeneration(GenerationInterface):
                     f"unified placement group has {len(flat)}."
                 )
 
-            tied_groups: list[tuple[int, list[int]]] = []
-            cursor = 0
-            for tp in engine_tps:
-                # The first value is a placement-group index.
-                # A unified cluster has exactly one PG (index 0).
-                tied_groups.append((0, flat[cursor : cursor + tp]))
-                cursor += tp
+            mnnvl_engines: list[int] = []
+            for engine, role in enumerate(self._engine_roles):
+                engine_config = (
+                    role_engine_config(self.cfg, role)
+                    if role in ("prefill", "decode")
+                    else self.cfg["trtllm_cfg"]
+                )
+                engine_kwargs = engine_config.get("trtllm_kwargs")
+                if (
+                    engine_kwargs is not None
+                    and engine_kwargs.get("allreduce_strategy") == "MNNVL"
+                ):
+                    mnnvl_engines.append(engine)
+            if mnnvl_engines:
+                nodes = list(dict.fromkeys(bundle_to_node[bundle] for bundle in flat))
+                clique_results = ray.get(
+                    [
+                        _node_multicast_cliques.options(
+                            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                                node, soft=False
+                            )
+                        ).remote()
+                        for node in nodes
+                    ]
+                )
+                node_cliques = dict(zip(nodes, clique_results, strict=True))
+                groups = _place_mnnvl_engines(
+                    flat=flat,
+                    bundle_to_node=bundle_to_node,
+                    node_cliques=node_cliques,
+                    engine_tps=engine_tps,
+                    mnnvl_engines=mnnvl_engines,
+                )
+                for engine in mnnvl_engines:
+                    print(
+                        f"MNNVL placement: engine={engine}, "
+                        f"nodes={list(dict.fromkeys(bundle_to_node[b] for b in groups[engine]))}",
+                        flush=True,
+                    )
+                tied_groups = [(0, group) for group in groups]
+            else:
+                tied_groups = []
+                cursor = 0
+                for tp in engine_tps:
+                    tied_groups.append((0, flat[cursor : cursor + tp]))
+                    cursor += tp
         else:
             tied_groups = []
             engine_idx = 0

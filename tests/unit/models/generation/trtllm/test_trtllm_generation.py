@@ -172,6 +172,8 @@ def test_cross_node_tp_replicas_use_unified_placement_group():
     # Bundles are handed out engine by engine, so the widths are what the
     # slicing follows -- two engines of 8 across the 16-bundle unified PG.
     generation._engine_tps = [8, 8]
+    generation._engine_roles = ["aggregated", "aggregated"]
+    generation.cfg = _config()
     generation.worker_group = MagicMock()
 
     unified_pg = MagicMock()
@@ -676,3 +678,59 @@ def test_configure_generation_config_load_format_reaches_both_disagg_engines(
     )
     for role in ("prefill", "decode"):
         assert role_engine_config(configured, role)["load_format"] == "dummy"
+
+
+def test_mnnvl_placement_avoids_multicast_clique_boundary() -> None:
+    flat = list(range(64))
+    bundle_to_node = {i: f"node-{i // 4}" for i in flat}
+    cliques = {
+        f"node-{i}": {("same-unicast-domain", "mc-a" if i < 7 else "mc-b")}
+        for i in range(16)
+    }
+    groups = trtllm_generation._place_mnnvl_engines(
+        flat=flat,
+        bundle_to_node=bundle_to_node,
+        node_cliques=cliques,
+        engine_tps=[8, 8, 8, 8, 16, 16],
+        mnnvl_engines=[0, 1, 2, 3],
+    )
+    assert groups[3] == list(range(28, 36))
+    assert sorted(bundle for group in groups for bundle in group) == flat
+    for group in groups[:4]:
+        assert set.intersection(*(cliques[bundle_to_node[b]] for b in group))
+
+
+def test_mnnvl_placement_rejects_insufficient_multicast_clique() -> None:
+    with pytest.raises(ValueError, match="one multicast pointer clique"):
+        trtllm_generation._place_mnnvl_engines(
+            flat=list(range(8)),
+            bundle_to_node={i: str(i // 4) for i in range(8)},
+            node_cliques={"0": {("uuid", "a")}, "1": {("uuid", "b")}},
+            engine_tps=[8],
+            mnnvl_engines=[0],
+        )
+
+
+@pytest.mark.parametrize("first_domain_nodes, feasible", [(7, False), (8, True)])
+def test_mnnvl_pd_placement_requires_capacity_for_both_roles(
+    first_domain_nodes: int, feasible: bool
+) -> None:
+    flat = list(range(64))
+    kwargs = dict(
+        flat=flat,
+        bundle_to_node={i: str(i // 4) for i in flat},
+        node_cliques={
+            str(i): {("uuid", "a" if i < first_domain_nodes else "b")}
+            for i in range(16)
+        },
+        engine_tps=[8, 8, 8, 8, 16, 16],
+        mnnvl_engines=list(range(6)),
+    )
+    if not feasible:
+        with pytest.raises(ValueError, match="one multicast pointer clique"):
+            trtllm_generation._place_mnnvl_engines(**kwargs)
+    else:
+        groups = trtllm_generation._place_mnnvl_engines(**kwargs)
+        assert sorted(bundle for group in groups for bundle in group) == flat
+        for group in groups:
+            assert len({bundle // (8 * 4) for bundle in group}) == 1
