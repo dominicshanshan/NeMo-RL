@@ -1,0 +1,67 @@
+# Ultra SWE rollout-only, ready-first SC scheduling, on the 1P2D layout of legacy job 572703:
+# 1 DEP32 MegaMoE prefill + 2 DEP16 TRTLLM-MoE decode = 64 GPUs = 16 GB200 nodes per replica.
+# Everything that enables ready-first (async_rl.sampler, data_plane, grpo.async_grpo: null, ...) is
+# inherited from the parent; this file only replaces the parent's 2P2D engine layout.
+# Run with examples/run_single_controller_simulator.py --mode rollout_only --train-backend cpu
+#   --num-nodes 16 --num-steps 5 --train-time-s 2400 --refit-time-s 0.
+defaults: grpo_ultra_swe_trtllm_disagg_dep16_sc_rollout_only.yaml
+
+cluster:
+  segment_size: 8                    # Slurm --segment=8 with one pod pinned, as 572703
+
+grpo:
+  max_num_steps: 5                   # parent: 3
+
+policy:
+  generation:
+    trtllm_kwargs:
+      # 572703 ran Modeling V1. Pinned so the newer TRT-LLM's "auto" cannot switch this run to V2.
+      modeling_v2: "off"
+    disaggregation:
+      num_prefill_engines: 1         # parent: 2
+      num_decode_engines: 2
+    trtllm_cfg:
+      disagg_server:
+        # Keeps each conversation on the decode engine that holds its KV. Pooled load_balancing
+        # sent about half of the turns to the other engine, which then received the whole prompt again.
+        gen_router: conversation     # parent: load_balancing
+      prefill_engine:
+        # DEP32: attention data parallel across 32 ranks, 16 full experts per rank.
+        tensor_parallel_size: 32
+        moe_tensor_parallel_size: 1
+        moe_expert_parallel_size: 32
+        max_num_tokens: 1024
+        trtllm_kwargs:
+          moe_config:
+            backend: MEGAMOE_CUTEDSL
+            max_num_tokens: 1024     # MegaMoE reads this as the per-rank chunk cap
+          env_overrides:
+            TLLM_CUDA_OBJECT_COLLECTIVES: "1"
+            # MegaMoE with NCCL votes deadlocks without reserved SMs.
+            TRTLLM_CUTEDSL_SM_RESERVE: "8"
+          disable_overlap_scheduler: true
+          scheduler_config:
+            # Admit the pending context requests with the fewest uncached prompt tokens first.
+            context_scheduling_policy: shortest_uncached_first
+      decode_engine:
+        max_batch_size: 32
+        max_num_tokens: 4096
+        trtllm_kwargs:
+          moe_config:
+            backend: TRTLLM
+
+env:
+  nemo_gym:
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          swebench_agent_timeout: 1800   # parent: 3600
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          swebench_agent_timeout: 1800   # parent: 3600
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          # Required by conversation routing: the router keys on this id.
+          forward_session_id_as_conversation_id: true
